@@ -13,21 +13,28 @@ We define a raw pointer type and two user-facing types built on it:
 * `ExternrefRef<'a>` which represents a borrowed externref pointer that is
    guaranteed to be valid for lifetime `'a`.
 
-These all have the ABI of `__externref_t*` when passed to/from `extern "C"`
-functions. (Or any other non "rust" ABI functions, I'm going to call them
-`extern "C"` functions throughout.)
+These are all passed as a slot pointer to/from `extern "C"` functions. (Or any
+other non "rust" ABI functions, I'm going to call them `extern "C"` functions
+throughout.)
 
 It is a key requirement for us that it should be possible to call C functions
 that take and return `__externref_t` directly. For this reason, we define a
 `ByValue<_>` struct that can be used to wrap `Externref` and `ExternrefRef<'a>`.
 It marks the parameters and return values of `extern "C"` functions as
-representing `__externref_t` instead of `__externref_t*`. If any of the
+representing `__externref_t` instead of a slot pointer. If any of the
 parameters or the return values have the `ByValue<_>` marker, the compiler emits
-appropriate wrappers to adapt between `__externref_t*` and `__externref_t`.
+appropriate wrappers to adapt between the slot pointer and `__externref_t`.
 
 The only place that we materialize a true `externref` is at the boundary of an
 `extern "C"` function when a parameter or return type is explicitly marked
 `ByValue<_>`.
+
+The table holding the slots can be owned by Rust, so the proposal does not
+depend on any new backend support. There is an LLVM RFC for pointers to
+externref which makes the same table visible to LLVM and to C. This enables
+optimization of the table operations, and sharing of slot pointers with C as
+`__externref_t*`. The proposal is structured so that adopting it is a change of
+representation only, in two [implementation phases](#implementation-phases).
 
 ## Background
 
@@ -48,7 +55,7 @@ table slot is therefore the only way a module can keep one in a long-lived data
 structure or pass its address around, by representing it as a slot index that
 *can* be stored in memory.
 
-### Dependency: LLVM RFC to add support for pointer to externref
+### LLVM RFC to add support for pointer to externref
 
 There is an
 [LLVM RFC](https://discourse.llvm.org/t/rfc-webassembly-externref-t-pointers-in-clang-and-llvm/91914)
@@ -76,8 +83,59 @@ This are almost the same attributes as are present on `malloc` and `free`. These
 attributes allow a paired `__externref_table_alloc` and `__externref_table_free`
 to be optimized out.
 
-Because C and Rust objects linked together share the same table, no glue code is
-needed to pass externref pointers between them.
+With this, C and Rust objects linked together share the same table, so no glue
+code is needed to pass externref pointers between them.
+
+## Implementation Phases
+
+The specification below is written against an opaque slot pointer and a small
+set of functions, so nothing in it depends on how the backend represents a slot
+pointer or on who provides the table. That allows the work to land in two
+phases, with the second changing only the representation. No user code changes
+between them.
+
+### Phase 1: a Rust-owned table
+
+Everything needed already exists in LLVM: the `externref` IR type,
+`externref`-typed function parameters and returns, and the
+`llvm.wasm.table.get/set/grow.externref`, `ref.null`, and `ref.is_null`
+intrinsics over a table global and an integer index. Rust supplies the rest
+itself:
+
+* `externref_ptr` is represented as a plain `usize` index into the table. The
+  type stays opaque, so this is invisible to users.
+* Rust defines the table and ships the slot allocator in compiler-builtins,
+  written in Rust over the table intrinsics. Slot `0` is never allocated.
+* The table and allocator have Rust-private symbol names, so they cannot collide
+  with symbols that existing toolchains already export, such as wasm-bindgen's
+  `__externref_table_alloc`.
+* There is no table stack. A slot that is scoped to a call is a heap slot which
+  is freed on exit.
+
+This is the model that toolchains such as wasm-bindgen implement today, moved
+into the compiler. By-value `externref` interop with C and with the host is
+complete in this phase. What it lacks is optimization of the table operations,
+since an integer index carries no provenance and the allocator calls are opaque,
+and sharing of slot pointers with C, since C has no pointer to externref type.
+
+### Phase 2: with the LLVM RFC
+
+Once `ptr addrspace(2)` is available in LLVM, `externref_ptr` becomes that
+pointer, the table becomes the one blessed by LLVM, and the allocator functions
+forward to compiler-rt's `__externref_table_alloc` and `__externref_table_free`,
+declared with all the attributes that LLVM normally emits. This adds:
+
+* **Optimization.** LLVM performs alias analysis on `addrspace(2)` pointers just
+  as it does on memory pointers, and the default `-O2` pipeline removes paired
+  allocations whose slot does not escape.
+* **A table stack.** A slot that is scoped to a call becomes an `alloca` in
+  `addrspace(2)`.
+* **Pointer interop with C.** A slot pointer is an `__externref_t*`, so slot
+  pointers pass between C and Rust with no glue, and a slot allocated in C may
+  be freed in Rust or vice versa.
+
+A backend other than LLVM can stay at the phase 1 representation indefinitely;
+`__externref_t*` is an `i32` at the wasm level either way.
 
 ## Specification
 
@@ -93,18 +151,19 @@ pub struct externref_ptr {
 }
 ```
 
-This type is a lang item with the ABI of `__externref_t*`, lowering to
-`ptr addrspace(2)`. It is a thin pointer whose pointee cannot be read or written
-directly from Rust since the pointee is not made of bytes; the helpers below are
-the only way to read or write the slot. It is `Copy` and pointer-sized. Like raw
-pointers, it is `!Send + !Sync`.
+This type is a lang item representing a pointer to a table slot. It is a thin
+pointer whose pointee cannot be read or written directly from Rust since the
+pointee is not made of bytes; the functions below are the only way to read or
+write the slot. It is `Copy` and pointer-sized. Like raw pointers, it is
+`!Send + !Sync`. In phase 1 it is represented as a table index, and in phase 2
+as `ptr addrspace(2)` with the ABI of `__externref_t*`.
 
-It is a pointer with provenance, following the same rules as `*mut T`. Index `0`
-is reserved by LLVM as a null niche. Each `__externref_table_alloc` call
-produces a distinct allocation, and LLVM performs alias analysis on
-`addrspace(2)` pointers just as it does on memory pointers. It is not allowed to
-cast `externref_ptr` directly to or from an integer, but it is possible to use
-`expose_provenance()` and `with_exposed_provenance()` to do so.
+Its semantics are those of a pointer with provenance in both phases, following
+the same rules as `*mut T`, so that code written against phase 1 remains valid
+in phase 2. Slot `0` is reserved as a null niche. Each `externref_alloc` call
+produces a distinct allocation. It is not allowed to cast `externref_ptr`
+directly to or from an integer, but it is possible to use `expose_provenance()`
+and `with_exposed_provenance()` to do so.
 
 It is only available on `wasm32`/`wasm64` targets with the `reference-types`
 target feature, and lives in `core::arch::wasm32` alongside the types below.
@@ -112,49 +171,41 @@ target feature, and lives in `core::arch::wasm32` alongside the types below.
 ### Intrinsic Helpers
 
 ```rs
-unsafe extern "C" {
-    /// Allocates `nslots` contiguous slots, each holding `ref.null`.
-    safe fn __externref_table_alloc(nslots: usize) -> externref_ptr;
+// core::arch::wasm32
 
-    /// Frees an allocation from `__externref_table_alloc`.
-    unsafe fn __externref_table_free(ptr: externref_ptr);
+/// Allocates `nslots` contiguous slots, each holding `ref.null`.
+pub fn externref_alloc(nslots: usize) -> externref_ptr;
 
-    /// `*to = *from`
-    unsafe fn __externref_assign(from: externref_ptr, to: externref_ptr);
+/// Frees an allocation from `externref_alloc`.
+pub unsafe fn externref_free(ptr: externref_ptr);
 
-    /// `*ptr = ref.null`
-    unsafe fn __externref_set_null(ptr: externref_ptr);
+/// `*to = *from`
+pub unsafe fn externref_assign(from: externref_ptr, to: externref_ptr);
 
-    /// `ref.is_null(*ptr)`
-    unsafe fn __externref_is_null(ptr: externref_ptr) -> bool;
-}
+/// `*ptr = ref.null`
+pub unsafe fn externref_set_null(ptr: externref_ptr);
+
+/// `ref.is_null(*ptr)`
+pub unsafe fn externref_is_null(ptr: externref_ptr) -> bool;
 ```
 
-`__externref_table_alloc` and `__externref_table_free` are implemented in
-compiler-rt as part of the LLVM RFC. Rust picks them up through
-`compiler-builtins`' `c` feature. A freshly allocated slot contains `ref.null`
-and `__externref_table_free` nulls the slot before returning it to the free
-list, so a freed slot never pins a host object. When emitting LLVM IR
-declarations for them, Rust should include all the attributes that LLVM normally
-emits in order to allow the best possible code generation.
+These are functions of `core::arch::wasm32`, like `memory_grow`, rather than
+`extern "C"` symbols. What they link against is an implementation detail which
+differs between the phases, and no symbol name is part of the interface.
 
-The remaining helpers have the following C definitions. They are one
-instruction each, so the compiler is free to treat them as intrinsics and inline
-the `table.get`/`table.set`.
+A freshly allocated slot contains `ref.null` and `externref_free` nulls the slot
+before returning it to the free list, so a freed slot never pins a host object.
+The allocator is provided by compiler-builtins in phase 1 and by compiler-rt in
+phase 2.
 
-```C
-void __externref_assign(__externref_t* from, __externref_t* to) {
-    *to = *from;
-}
+The remaining functions are single table operations, which the compiler emits
+inline:
 
-void __externref_set_null(__externref_t* ptr) {
-    *ptr = __builtin_wasm_ref_null_extern();
-}
-
-int __externref_is_null(__externref_t* ptr) {
-    return __builtin_wasm_ref_is_null_extern(*ptr);
-}
-```
+| Function | Wasm |
+|---|---|
+| `externref_assign(from, to)` | `table.set(to, table.get(from))` |
+| `externref_set_null(ptr)` | `table.set(ptr, ref.null extern)` |
+| `externref_is_null(ptr)` | `ref.is_null(table.get(ptr))` |
 
 ### Raw Pointer Safety Model
 
@@ -162,7 +213,7 @@ A table slot is an allocation, and `externref_ptr` is a raw pointer to it. The
 rules are those of `*mut T` with the table in place of memory:
 
 * **Undefined behaviour**: calling any helper on a null or freed slot; freeing a
-  slot twice; freeing a slot that did not come from `__externref_table_alloc`.
+  slot twice; freeing a slot that did not come from `externref_alloc`.
   The `unsafe` on the helpers gates these.
 * **Not undefined behaviour**: leaking a slot. Like `mem::forget`, it pins the
   host object but violates no Rust invariant. A slot *containing* `ref.null` is
@@ -171,9 +222,9 @@ rules are those of `*mut T` with the table in place of memory:
 
 ### From Pointers to By-Value Externrefs
 
-`externref_ptr` and its helpers are enough to share externrefs with C code that
-uses `__externref_t*`. They are not enough to call a host import or a C function
-that takes or returns a bare `__externref_t`. For that, the compiler must
+`externref_ptr` and its helpers are enough to hold externrefs and to pass their
+slots between Rust functions. They are not enough to call a host import or a C
+function that takes or returns a bare `__externref_t`. For that, the compiler must
 convert between slot and value at the `extern "C"` boundary, and some type in
 the signature has to mark the positions where it does so.
 
@@ -283,15 +334,15 @@ impl<T: AsExternref + ?Sized> AsExternref for &T { /* ... */ }
 
 impl ExternrefRef<'_> {
     pub fn is_null(self) -> bool {
-        unsafe { __externref_is_null(self.ptr) }
+        unsafe { externref_is_null(self.ptr) }
     }
 
     pub fn set(self, src: impl AsExternref) {
-        unsafe { __externref_assign(src.as_externref().ptr, self.ptr) }
+        unsafe { externref_assign(src.as_externref().ptr, self.ptr) }
     }
 
     pub fn set_null(self) {
-        unsafe { __externref_set_null(self.ptr) }
+        unsafe { externref_set_null(self.ptr) }
     }
 
     /// Copies the referenced value into a new owned slot.
@@ -319,14 +370,14 @@ pub struct Externref { ptr: externref_ptr }
 impl Externref {
     /// Allocates an externref pointer with value initialized to `ref.null`.
     pub fn null() -> Externref {
-        Externref { ptr: __externref_table_alloc(1) }
+        Externref { ptr: externref_alloc(1) }
     }
 
     pub fn is_null(&self) -> bool { self.as_externref().is_null() }
     pub fn set(&self, src: impl AsExternref) { self.as_externref().set(src) }
     pub fn set_null(&self) { self.as_externref().set_null() }
 
-    /// `ptr` must be a live allocation from `__externref_table_alloc` that
+    /// `ptr` must be a live allocation from `externref_alloc` that
     /// nothing else owns.
     pub unsafe fn from_raw(ptr: externref_ptr) -> Self { /* ... */ }
 
@@ -336,7 +387,7 @@ impl Externref {
 
 impl Drop for Externref {
     fn drop(&mut self) {
-        unsafe { __externref_table_free(self.ptr) };
+        unsafe { externref_free(self.ptr) };
     }
 }
 
@@ -384,13 +435,17 @@ The four by-value positions and the slot each one works with are:
 | Position | Type | Wrapper | Slot ownership |
 |---|---|---|---|
 | import parameter | `ByValue<ExternrefRef<'_>>` | `table.get` the slot, pass the value | caller lends for the call |
-| import return | `ByValue<Externref>` | `__externref_table_alloc(1)`, `table.set` the value | caller owns |
-| export parameter | `ByValue<ExternrefRef<'_>>` | `table.set` into a table-stack slot of the wrapper, pass its address | wrapper lends for the call |
-| export return | `ByValue<Externref>` | `table.get`, `__externref_table_free`, return the value | body transfers, wrapper frees |
+| import return | `ByValue<Externref>` | `externref_alloc(1)`, `table.set` the value | caller owns |
+| export parameter | `ByValue<ExternrefRef<'_>>` | `table.set` into a slot scoped to the call, pass its address | wrapper lends for the call |
+| export return | `ByValue<Externref>` | `table.get`, `externref_free`, return the value | body transfers, wrapper frees |
 
 The by-value translation happens inside the Rust object, so the wasm the linker
 sees uses plain `externref` parameters and results. Clang, GCC, or hand-written
 wat link against it without knowing anything about Rust.
+
+The conversions below are shown in C, using the notation of the LLVM RFC in
+which an `__externref_t*` is a slot pointer, `*p` is a `table.get` and `*p = x`
+is a `table.set`. They are the same in both phases.
 
 #### Import ABI Wrappers
 
@@ -412,7 +467,7 @@ to a compiler-generated wrapper that translates each `ByValue` position:
   `Externref`. In C the conversion code would look like:
   ```C
   __externref_t* convert_return_value(__externref_t retval) {
-    __externref_t* result = __externref_table_alloc(1);
+    __externref_t* result = externref_alloc(1);
     *result = retval;
     return result;
   }
@@ -435,7 +490,7 @@ __externref_t c_import(__externref_t x, __externref_t* y);
 ```
 
 Only the `ByValue` parameter and the return are translated; `y` is already a
-pointer.
+pointer, which C can receive in phase 2.
 
 Calls to `c_import` from Rust resolve to an implicit wrapper that loads the
 argument slot, allocates a slot for the return value, and stores into it. In
@@ -467,7 +522,8 @@ Rust body with slot pointers:
   `ByValue<ExternrefRef<'_>>` and call `.to_owned()` in the body if an owned
   slot is needed.
 * `ByValue<ExternrefRef<'_>>` argument: Store the incoming `__externref_t` into
-  an alloca and pass the alloca pointer. In C the conversion looks like:
+  a slot scoped to the call and pass its address. In phase 2 this is an alloca
+  on the table stack. In C the conversion looks like:
   ```C
   __externref_t* wrapper(..., __externref_t by_value_arg, /* ... other args */) {
     return rust_func(..., &by_value_arg, ...);
@@ -479,7 +535,7 @@ Rust body with slot pointers:
   ```C
   __externref_t convert_return_value(__externref_t* retval) {
     __externref_t result = *retval;
-    __externref_table_free(retval);
+    externref_free(retval);
     return result;
   }
   ```
@@ -501,7 +557,7 @@ wrapper:
 __externref_t c_export(__externref_t x) {
     __externref_t* result_ptr = orig_c_export(&x);
     __externref_t result = *result_ptr;
-    __externref_table_free(result_ptr);
+    externref_free(result_ptr);
     return result;
 }
 ```
@@ -613,8 +669,9 @@ extern "C" fn rust_id(x: ByValue<ExternrefRef<'_>>) -> ByValue<Externref> {
 
 #### Structs
 
-A `repr(C)` struct containing `Externref` fields corresponds to a C struct
-containing `__externref_t*` fields. No translation is applied.
+No translation is applied to struct fields. In phase 2, a `repr(C)` struct
+containing `Externref` fields corresponds to a C struct containing
+`__externref_t*` fields.
 
 ```rs
 #[repr(C)]
@@ -636,7 +693,7 @@ because no such C struct can exist.
 
 #### Borrowed slots across the boundary
 
-C code that passes the address of a table-stack local, e.g.
+In phase 2, C code that passes the address of a table-stack local, e.g.
 
 ```C
 void c_fn(__externref_t* p);
@@ -653,12 +710,13 @@ is declared in Rust as `fn c_fn(p: ExternrefRef<'_>)` or, for a Rust export,
 pub fn with_stack_slot<R>(f: impl for<'a> FnOnce(ExternrefRef<'a>) -> R) -> R;
 ```
 
-A scoped intrinsic lowered to an `alloca` of one `__externref_t` in
-`addrspace(2)`: the slot is set to `ref.null` on entry, the closure receives
-its address, and it is cleared again on exit so the table stack does not pin
-host objects after the scope ends. The HRTB lifetime prevents the slot from
-escaping; code that needs the value afterwards calls `to_owned()` and gets an
-explicit heap `Externref`.
+A scoped intrinsic providing a slot for the duration of the closure: the slot is
+set to `ref.null` on entry, the closure receives its address, and it is cleared
+again on exit so that it does not pin host objects after the scope ends. In
+phase 2 it is lowered to an `alloca` of one `__externref_t` in `addrspace(2)`,
+and in phase 1 to a heap slot which is freed on exit. The HRTB lifetime prevents
+the slot from escaping; code that needs the value afterwards calls `to_owned()`
+and gets an explicit heap `Externref`.
 
 The use case is scratch slots in small, frequently-called functions, where an
 `Externref::null()` cannot be hoisted out of a loop because the function
@@ -674,8 +732,9 @@ fn swap(a: ExternrefRef<'_>, b: ExternrefRef<'_>) {
 }
 ```
 
-The other common case is a C function that returns through an out-pointer,
-where the received value is only forwarded:
+The other common case, once slot pointers can be shared with C in phase 2, is a
+C function that returns through an out-pointer, where the received value is only
+forwarded:
 
 ```C
 void lookup(const char* key, __externref_t* out);
@@ -702,52 +761,17 @@ wrapper allocates a heap slot for the result; Rust has no way to express
 "return into this slot", so that allocation stays unless the optimizer removes
 it.
 
-### Phasing
-
-The user-facing surface is opaque types and functions, so nothing in it depends
-on how the backend represents a slot pointer. That allows the work to land in
-two phases, with the second changing only the representation.
-
-#### Phase 1: without the LLVM RFC
-
-Everything the wrappers need already exists in LLVM: the `externref` IR type,
-`externref`-typed function parameters and returns, and the
-`llvm.wasm.table.get/set/grow.externref`, `ref.null`, and `ref.is_null`
-intrinsics over a table global and an integer index. During the initial
-experimentation phase Rust can supply the rest itself:
-
-* `externref_ptr` is represented as a plain `usize` index. The type stays
-  opaque, so this is invisible to users.
-* Rust defines the table global and ships the slot allocator in
-  compiler-builtins, written in Rust over the table intrinsics. The table and
-  helper symbols use the names the LLVM RFC proposes.
-* There is no table stack, so the export wrapper's parameter slot and
-  `with_stack_slot` use a heap slot that is freed on exit.
-
-C interop works in this phase for by-value `__externref_t` but not for
-`__externref_t*`. Interop is therefore enabled, but optimisation of table
-lookups is not supported yet.
-
-#### Phase 2: with the LLVM RFC
-
-Once `ptr addrspace(2)` lands in LLVM, `externref_ptr` becomes that pointer
-and the allocator comes from compiler-rt with its `malloc`-style attributes.
-The wrapper alloc/free pairs now have allocator provenance and the default
-`-O2` pipeline removes the non-escaping ones. No user code changes.
-
-A backend other than LLVM can stay at the phase 1 representation
-indefinitely; `__externref_t*` is an `i32` at the wasm level either way.
-
 ### Optimizing out allocations
 
-Most `__externref_table_alloc`/`__externref_table_free` pairs introduced by
-the wrappers have the shape
+This section applies to phase 2, where the allocator has the attributes given in
+the LLVM RFC. Most `externref_alloc`/`externref_free` pairs introduced by the
+wrappers have the shape
 
 ```C
-__externref_t* p = __externref_table_alloc(1);
+__externref_t* p = externref_alloc(1);
 *p = x;
 use(*p);
-__externref_table_free(p);
+externref_free(p);
 ```
 where the slot never escapes as a pointer. The default `-O2` compilation
 pipeline will optimize this to the following:
@@ -767,10 +791,10 @@ Attributor and is not in the default compilation pipeline. Using
 `with_stack_slot` manually ensures that no allocation occurs in these cases. For
 example, here the pointer escapes:
 ```C
-__externref_t* p = __externref_table_alloc(1);
+__externref_t* p = externref_alloc(1);
 *p = x;
 use(p);
-__externref_table_free(p);
+externref_free(p);
 ```
 Ideally after optimizations the output would be the same as for the following:
 ```C
@@ -786,4 +810,5 @@ has to give it to a host function and the Attributor probably can't prove
 anything about what happens from there.
 
 In phase 1 none of this applies: an integer index carries no provenance and
-the helpers are opaque calls, so every wrapper allocation is executed.
+the allocator calls are opaque, so every wrapper allocation is executed, as it
+is in existing toolchains today.
