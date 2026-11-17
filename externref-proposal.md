@@ -107,8 +107,7 @@ itself:
 * Rust defines the table and ships the slot allocator in compiler-builtins,
   written in Rust over the table intrinsics. Slot `0` is never allocated.
 * The table and allocator have Rust-private symbol names, so they cannot collide
-  with symbols that existing toolchains already export, such as wasm-bindgen's
-  `__externref_table_alloc`.
+  with symbols that existing toolchains already export.
 * There is no table stack. A slot that is scoped to a call is a heap slot which
   is freed on exit.
 
