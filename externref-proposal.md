@@ -106,8 +106,10 @@ itself:
   type stays opaque, so this is invisible to users.
 * Rust defines the table and ships the slot allocator in compiler-builtins,
   written in Rust over the table intrinsics. Slot `0` is never allocated.
-* The table and allocator have Rust-private symbol names, so they cannot collide
-  with symbols that existing toolchains already export.
+* All symbols are private. The table and allocator are internal to the linked
+  module under Rust-private symbol names, and nothing is exported from or
+  imported into the Wasm module. They therefore cannot collide with symbols that
+  existing toolchains already export.
 * There is no table stack. A slot that is scoped to a call is a heap slot which
   is freed on exit.
 
@@ -116,6 +118,11 @@ into the compiler. By-value `externref` interop with C and with the host is
 complete in this phase. What it lacks is optimization of the table operations,
 since an integer index carries no provenance and the allocator calls are opaque,
 and sharing of slot pointers with C, since C has no pointer to externref type.
+
+Dynamic linking is out of scope for this phase. Each linked module has its own
+private table, so a slot pointer is only meaningful within it. Between
+separately linked modules externrefs are passed by value, which needs nothing
+shared.
 
 ### Phase 2: with the LLVM RFC
 
@@ -132,6 +139,10 @@ declared with all the attributes that LLVM normally emits. This adds:
 * **Pointer interop with C.** A slot pointer is an `__externref_t*`, so slot
   pointers pass between C and Rust with no glue, and a slot allocated in C may
   be freed in Rust or vice versa.
+* **Dynamic linking.** Passing slot pointers between separately linked modules
+  requires them to share the table and its allocator, as they do the function
+  table and `malloc`. How these are imported and exported is defined by LLVM and
+  the WebAssembly tool conventions, rather than by this proposal.
 
 A backend other than LLVM can stay at the phase 1 representation indefinitely;
 `__externref_t*` is an `i32` at the wasm level either way.
