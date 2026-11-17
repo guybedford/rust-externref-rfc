@@ -183,8 +183,8 @@ target feature, and lives in `core::arch::wasm32` alongside the types below.
 ```rs
 // core::arch::wasm32
 
-/// Allocates `nslots` contiguous slots, each holding `ref.null`.
-pub fn externref_alloc(nslots: usize) -> externref_ptr;
+/// Allocates a slot holding `ref.null`.
+pub fn externref_alloc() -> externref_ptr;
 
 /// Frees an allocation from `externref_alloc`.
 pub unsafe fn externref_free(ptr: externref_ptr);
@@ -207,6 +207,9 @@ A freshly allocated slot contains `ref.null` and `externref_free` nulls the slot
 before returning it to the free list, so a freed slot never pins a host object.
 The allocator is provided by compiler-builtins in phase 1 and by compiler-rt in
 phase 2.
+
+Each allocation is a single slot. Contiguous runs of slots, which the LLVM RFC
+supports for C arrays, are left out of this proposal.
 
 The remaining functions are single table operations, which the compiler emits
 inline:
@@ -380,7 +383,7 @@ pub struct Externref { ptr: externref_ptr }
 impl Externref {
     /// Allocates an externref pointer with value initialized to `ref.null`.
     pub fn null() -> Externref {
-        Externref { ptr: externref_alloc(1) }
+        Externref { ptr: externref_alloc() }
     }
 
     pub fn is_null(&self) -> bool { self.as_externref().is_null() }
@@ -445,7 +448,7 @@ The four by-value positions and the slot each one works with are:
 | Position | Type | Wrapper | Slot ownership |
 |---|---|---|---|
 | import parameter | `ByValue<ExternrefRef<'_>>` | `table.get` the slot, pass the value | caller lends for the call |
-| import return | `ByValue<Externref>` | `externref_alloc(1)`, `table.set` the value | caller owns |
+| import return | `ByValue<Externref>` | `externref_alloc()`, `table.set` the value | caller owns |
 | export parameter | `ByValue<ExternrefRef<'_>>` | `table.set` into a slot scoped to the call, pass its address | wrapper lends for the call |
 | export return | `ByValue<Externref>` | `table.get`, `externref_free`, return the value | body transfers, wrapper frees |
 
@@ -477,7 +480,7 @@ to a compiler-generated wrapper that translates each `ByValue` position:
   `Externref`. In C the conversion code would look like:
   ```C
   __externref_t* convert_return_value(__externref_t retval) {
-    __externref_t* result = externref_alloc(1);
+    __externref_t* result = externref_alloc();
     *result = retval;
     return result;
   }
@@ -778,7 +781,7 @@ the LLVM RFC. Most `externref_alloc`/`externref_free` pairs introduced by the
 wrappers have the shape
 
 ```C
-__externref_t* p = externref_alloc(1);
+__externref_t* p = externref_alloc();
 *p = x;
 use(*p);
 externref_free(p);
@@ -801,7 +804,7 @@ Attributor and is not in the default compilation pipeline. Using
 `with_stack_slot` manually ensures that no allocation occurs in these cases. For
 example, here the pointer escapes:
 ```C
-__externref_t* p = externref_alloc(1);
+__externref_t* p = externref_alloc();
 *p = x;
 use(p);
 externref_free(p);
